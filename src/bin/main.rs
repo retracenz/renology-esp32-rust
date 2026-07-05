@@ -18,7 +18,7 @@ use critical_section::Mutex as CsMutex;
 use embassy_executor::Spawner;
 use embassy_futures::join::join;
 use embassy_futures::select::{Either, select};
-use embassy_time::{Duration, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use esp_hal::{
     clock::CpuClock,
     delay::Delay,
@@ -32,7 +32,7 @@ use esp_hal::{
 };
 use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
-use gobblegobble::renogy::{self, ChargerData};
+use gobblegobble::renogy::{self, ChargerData, StateInfo};
 use gobblegobble::sh1106::Sh1106;
 use trouble_host::prelude::*;
 
@@ -90,7 +90,7 @@ impl EventHandler for AdvWatcher {
 
 fn show_status(display: &mut Sh1106<'_>, line1: &str, line2: &str) {
     display.clear();
-    display.draw_text("gobble gobble", 12, 0, 1);
+    display.draw_text("Renology Reader", 4, 0, 1);
     display.draw_text(line1, 0, 28, 1);
     display.draw_text(line2, 0, 40, 1);
     display.flush();
@@ -100,7 +100,11 @@ fn fmt_volts(x10: u16) -> String {
     format!("{}.{}V", x10 / 10, x10 % 10)
 }
 
-fn show_data(display: &mut Sh1106<'_>, d: &ChargerData) {
+fn fmt_amps(x100: u16) -> String {
+    format!("{}.{}A", x100 / 100, (x100 % 100) / 10)
+}
+
+fn show_data(display: &mut Sh1106<'_>, d: &ChargerData, state: Option<u8>) {
     display.clear();
     display.draw_text("HOUSE", 0, 0, 1);
     let soc = format!("{}%", d.soc);
@@ -110,10 +114,97 @@ fn show_data(display: &mut Sh1106<'_>, d: &ChargerData) {
     display.draw_text("START", 0, 28, 1);
     display.draw_text(&fmt_volts(d.start_volts_x10), 0, 37, 2);
 
+    let state = state.map(renogy::charging_state_label).unwrap_or("");
     let amps = d.charge_amps_x100;
-    let bottom = format!("CHG {}.{}A SOL {}W", amps / 100, (amps % 100) / 10, d.solar_watts);
+    let bottom = format!(
+        "{} {}.{}A IN {}W",
+        state,
+        amps / 100,
+        (amps % 100) / 10,
+        d.input_watts()
+    );
     display.draw_text(&bottom, 0, 56, 1);
     display.flush();
+}
+
+/// Secondary screen with the data that doesn't fit on the main one.
+fn show_extras(display: &mut Sh1106<'_>, d: &ChargerData, info: Option<StateInfo>) {
+    display.clear();
+    display.draw_text(
+        &format!("ALT {} {}", fmt_volts(d.start_volts_x10), fmt_amps(d.alt_amps_x100)),
+        0,
+        0,
+        1,
+    );
+    display.draw_text(
+        &format!("SOL {} {}", fmt_volts(d.solar_volts_x10), fmt_amps(d.solar_amps_x100)),
+        0,
+        9,
+        1,
+    );
+    display.draw_text(&format!("IN {}W", d.input_watts()), 0, 18, 1);
+    display.draw_text(
+        &format!("TMP {}C BAT {}C", d.controller_temp, d.battery_temp),
+        0,
+        27,
+        1,
+    );
+    display.draw_text(
+        &format!(
+            "DAY {}.{}-{}.{}V",
+            d.min_volts_x10 / 10,
+            d.min_volts_x10 % 10,
+            d.max_volts_x10 / 10,
+            d.max_volts_x10 % 10
+        ),
+        0,
+        36,
+        1,
+    );
+    display.draw_text(&format!("AH TODAY {}", d.ah_today), 0, 45, 1);
+    let errors = match info {
+        Some(s) if s.faults != [0, 0] => format!("ERR {:04X} {:04X}", s.faults[0], s.faults[1]),
+        _ => String::from("ERR NONE"),
+    };
+    display.draw_text(&errors, 0, 54, 1);
+    display.flush();
+}
+
+/// How long the main screen shows in each display cycle.
+const MAIN_SECS: u64 = 20;
+/// How long the extras screen shows.
+const EXTRAS_SECS: u64 = 20;
+
+/// Send one Modbus read request and reassemble the notification response.
+/// Copies the register data into `out` and returns its length; returns 0 on
+/// response timeout.
+async fn read_registers<C: Controller, const MAX: usize>(
+    client: &GattClient<'_, C, DefaultPacketPool, MAX>,
+    write_char: &Characteristic<[u8]>,
+    listener: &mut NotificationListener<'_, 512>,
+    response: &mut renogy::ResponseBuffer,
+    reg: u16,
+    words: u16,
+    out: &mut [u8],
+) -> Result<usize, BleHostError<C::Error>> {
+    let request = renogy::read_request(renogy::DEVICE_ID, reg, words);
+    client
+        .write_characteristic_without_response(write_char, &request)
+        .await?;
+
+    response.reset();
+    loop {
+        match with_timeout(Duration::from_secs(3), listener.next()).await {
+            Ok(notification) => {
+                if let Some(data) = response.feed(notification.as_ref()) {
+                    let len = data.len().min(out.len());
+                    out[..len].copy_from_slice(&data[..len]);
+                    return Ok(len);
+                }
+            }
+            Err(_) => return Ok(0), // response timeout
+        }
+    }
 }
 
 #[allow(
@@ -253,42 +344,58 @@ async fn main(_spawner: Spawner) {
                 println!("subscribed, polling charger");
 
                 let mut response = renogy::ResponseBuffer::new();
+                let mut buf = [0u8; 64];
                 let mut misses = 0u32;
+                let started = Instant::now();
+                let mut last_good: Option<(ChargerData, Option<StateInfo>)> = None;
+                let mut showing_extras = false;
                 loop {
-                    let request =
-                        renogy::read_request(renogy::DEVICE_ID, renogy::DYNAMIC_REG, renogy::DYNAMIC_WORDS);
-                    client
-                        .write_characteristic_without_response(&write_char, &request)
-                        .await?;
+                    let n = read_registers(
+                        &client,
+                        &write_char,
+                        &mut listener,
+                        &mut response,
+                        renogy::DYNAMIC_REG,
+                        renogy::DYNAMIC_WORDS,
+                        &mut buf,
+                    )
+                    .await?;
+                    let data = ChargerData::parse(&buf[..n]);
 
-                    response.reset();
-                    let mut data = None;
-                    while data.is_none() {
-                        match with_timeout(Duration::from_secs(3), listener.next()).await {
-                            Ok(notification) => {
-                                if let Some(words) = response.feed(notification.as_ref()) {
-                                    data = ChargerData::parse(words);
-                                    break;
-                                }
-                            }
-                            Err(_) => break, // response timeout
-                        }
-                    }
+                    Timer::after_millis(100).await;
+                    let n = read_registers(
+                        &client,
+                        &write_char,
+                        &mut listener,
+                        &mut response,
+                        renogy::STATE_REG,
+                        renogy::STATE_WORDS,
+                        &mut buf,
+                    )
+                    .await?;
+                    let info = StateInfo::parse(&buf[..n]);
+                    let state = info.map(|i| i.charging_state);
 
                     match data {
                         Some(d) => {
                             misses = 0;
                             println!(
-                                "house {}.{}V soc {}% start {}.{}V chg {}A/100 solar {}W",
+                                "house {}.{}V soc {}% start {}.{}V chg {}A/100 solar {}W state {:?}",
                                 d.house_volts_x10 / 10,
                                 d.house_volts_x10 % 10,
                                 d.soc,
                                 d.start_volts_x10 / 10,
                                 d.start_volts_x10 % 10,
                                 d.charge_amps_x100,
-                                d.solar_watts
+                                d.solar_watts,
+                                state
                             );
-                            show_data(display, &d);
+                            last_good = Some((d, info));
+                            if showing_extras {
+                                show_extras(display, &d, info);
+                            } else {
+                                show_data(display, &d, state);
+                            }
                         }
                         None => {
                             misses += 1;
@@ -299,7 +406,23 @@ async fn main(_spawner: Spawner) {
                         }
                     }
 
-                    Timer::after_secs(1).await;
+                    // Sleep ~1s between polls, in slices so the screen cycle
+                    // (10s main / 5s extras) switches on time.
+                    for _ in 0..4 {
+                        Timer::after_millis(250).await;
+                        let extras_now = started.elapsed().as_secs() % (MAIN_SECS + EXTRAS_SECS)
+                            >= MAIN_SECS;
+                        if extras_now != showing_extras {
+                            showing_extras = extras_now;
+                            if let Some((d, info)) = last_good {
+                                if showing_extras {
+                                    show_extras(display, &d, info);
+                                } else {
+                                    show_data(display, &d, info.map(|i| i.charging_state));
+                                }
+                            }
+                        }
+                    }
                 }
             };
 

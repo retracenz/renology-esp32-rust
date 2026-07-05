@@ -21,6 +21,25 @@ pub const DEVICE_ID: u8 = 0xFF;
 pub const DYNAMIC_REG: u16 = 0x0100;
 pub const DYNAMIC_WORDS: u16 = 30;
 
+/// Charging state (low byte of 0x0120) and fault bits (0x0121, 0x0122).
+pub const STATE_REG: u16 = 0x0120;
+pub const STATE_WORDS: u16 = 3;
+
+/// Short display label for the charging state in the low byte of 0x0120.
+pub fn charging_state_label(state: u8) -> &'static str {
+    match state {
+        0 => "STDBY", // standby / deactivated
+        1 => "ACTIV", // activated
+        2 => "MPPT",
+        3 => "EQLZ",  // equalizing
+        4 => "BOOST",
+        5 => "FLOAT",
+        6 => "LIMIT", // current limiting
+        8 => "DCDC",  // alternator direct
+        _ => "?",
+    }
+}
+
 /// Live values decoded from the dynamic block at 0x0100.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChargerData {
@@ -42,25 +61,75 @@ pub struct ChargerData {
     pub solar_amps_x100: u16,
     /// Solar power, watts.
     pub solar_watts: u16,
+    /// Controller temperature, degrees C.
+    pub controller_temp: i8,
+    /// Battery temperature, degrees C.
+    pub battery_temp: i8,
+    /// Lowest house battery voltage today, tenths of a volt.
+    pub min_volts_x10: u16,
+    /// Highest house battery voltage today, tenths of a volt.
+    pub max_volts_x10: u16,
+    /// Amp-hours charged today.
+    pub ah_today: u16,
+}
+
+/// Temperatures are sign-magnitude: bit 7 = negative.
+fn temp(raw: u8) -> i8 {
+    let magnitude = (raw & 0x7F) as i8;
+    if raw & 0x80 != 0 { -magnitude } else { magnitude }
 }
 
 impl ChargerData {
+    /// Power being drawn from the charger's input, watts. The RBC2125DS
+    /// reports the active input under the solar/MPPT registers even when
+    /// charging from the alternator, so sum both input slots.
+    pub fn input_watts(&self) -> u16 {
+        self.alt_watts + self.solar_watts
+    }
+
     /// Decode from the register data of a read of DYNAMIC_REG.
     pub fn parse(data: &[u8]) -> Option<Self> {
-        if data.len() < 20 {
+        if data.len() < 36 {
             return None;
         }
+        let temps = word(data, 3);
         Some(Self {
             soc: word(data, 0),
             house_volts_x10: word(data, 1),
             charge_amps_x100: word(data, 2),
-            // word 3 holds controller/battery temperatures
             start_volts_x10: word(data, 4),
             alt_amps_x100: word(data, 5),
             alt_watts: word(data, 6),
             solar_volts_x10: word(data, 7),
             solar_amps_x100: word(data, 8),
             solar_watts: word(data, 9),
+            controller_temp: temp((temps >> 8) as u8),
+            battery_temp: temp(temps as u8),
+            min_volts_x10: word(data, 11),
+            max_volts_x10: word(data, 12),
+            ah_today: word(data, 17),
+        })
+    }
+}
+
+/// Charging state and fault bits from the STATE_REG block.
+#[derive(Clone, Copy, Debug)]
+pub struct StateInfo {
+    /// Charging state code; see [`charging_state_label`].
+    pub charging_state: u8,
+    /// Fault bit words from registers 0x0121 and 0x0122.
+    pub faults: [u16; 2],
+}
+
+impl StateInfo {
+    /// Decode from the register data of a read of STATE_REG.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < 6 {
+            return None;
+        }
+        Some(Self {
+            charging_state: data[1], // low byte of 0x0120
+            faults: [word(data, 1), word(data, 2)],
         })
     }
 }
