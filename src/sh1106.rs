@@ -83,7 +83,8 @@ impl<'d> Sh1106<'d> {
             let char_x = x + (i as i32) * font::GLYPH_WIDTH * scale;
             for (row, bits) in glyph.iter().enumerate() {
                 for col in 0..font::GLYPH_WIDTH {
-                    if bits >> (7 - col) & 1 != 0 {
+                    // font8x8 stores the leftmost pixel in the LSB
+                    if bits >> col & 1 != 0 {
                         for sy in 0..scale {
                             for sx in 0..scale {
                                 self.set_pixel(

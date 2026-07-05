@@ -1,61 +1,16 @@
-//! Minimal 8x8 font covering just the glyphs needed for the banner text.
-//! Each glyph is 8 rows, MSB = leftmost pixel.
+//! 8x8 ASCII font backed by the public-domain `font8x8` glyph set.
+//! Each glyph is 8 rows; in font8x8 the LSB is the leftmost pixel.
+
+use font8x8::legacy::BASIC_LEGACY;
 
 pub const GLYPH_WIDTH: i32 = 8;
 pub const GLYPH_HEIGHT: i32 = 8;
 
 pub fn glyph(c: char) -> [u8; 8] {
-    match c {
-        'g' => [
-            0b00000000,
-            0b00000000,
-            0b00111100,
-            0b01000010,
-            0b01000010,
-            0b00111110,
-            0b00000010,
-            0b00111100,
-        ],
-        'o' => [
-            0b00000000,
-            0b00000000,
-            0b00111100,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b00111100,
-            0b00000000,
-        ],
-        'b' => [
-            0b01000000,
-            0b01000000,
-            0b01111100,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01111100,
-            0b00000000,
-        ],
-        'l' => [
-            0b00110000,
-            0b00010000,
-            0b00010000,
-            0b00010000,
-            0b00010000,
-            0b00010000,
-            0b00111000,
-            0b00000000,
-        ],
-        'e' => [
-            0b00000000,
-            0b00000000,
-            0b00111100,
-            0b01000010,
-            0b01111110,
-            0b01000000,
-            0b00111100,
-            0b00000000,
-        ],
-        _ => [0; 8],
+    let idx = c as usize;
+    if idx < BASIC_LEGACY.len() {
+        BASIC_LEGACY[idx]
+    } else {
+        [0; 8]
     }
 }
