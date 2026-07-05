@@ -14,11 +14,6 @@ on a small OLED:
 While not connected it shows scan/connect status, and it reconnects by itself
 if the link drops.
 
-The old MicroPython version of this project (ADC voltage dividers instead of
-Bluetooth) is kept for reference in `esp32-micropython-backup/`. The directory
-is still called `gobblegobble` after the project's silly first incarnation; the
-crate itself is `renology-reader`.
-
 ## Hardware
 
 - ESP32 (original, Xtensa — WROOM-32E module)
