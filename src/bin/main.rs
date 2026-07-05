@@ -32,8 +32,8 @@ use esp_hal::{
 };
 use esp_println::println;
 use esp_radio::ble::controller::BleConnector;
-use gobblegobble::renogy::{self, ChargerData, StateInfo};
-use gobblegobble::sh1106::Sh1106;
+use renology_reader::renogy::{self, ChargerData, StateInfo};
+use renology_reader::sh1106::Sh1106;
 use trouble_host::prelude::*;
 
 #[panic_handler]
